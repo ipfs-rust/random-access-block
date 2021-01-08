@@ -51,6 +51,10 @@ impl Cid {
     pub fn len(&self) -> u64 {
         self.len
     }
+
+    pub fn select<T: Selectable>(&self, field: &str) -> Result<Self> {
+        T::select(self, field)
+    }
 }
 
 impl std::fmt::Display for Cid {
@@ -76,46 +80,13 @@ impl Default for Cid {
     }
 }
 
-pub struct Query<T: Archive> {
-    cid: Cid,
-    marker: PhantomData<T>,
-}
-
-impl<T: Archive> Query<T> {
-    pub fn new(cid: Cid) -> Self {
-        Self {
-            cid,
-            marker: PhantomData,
-        }
-    }
-
-    pub fn select<T2: Archive>(&self, range: Range<usize>) -> Query<T2> {
-        Query {
-            cid: self.cid.slice(range),
-            marker: PhantomData,
-        }
-    }
-
-    pub fn decode(&self, response: &[u8]) -> Result<Slice<T>> {
-        Slice::decode(self.cid, response)
-    }
-}
-
-impl<T: Archive> std::ops::Deref for Query<T> {
-    type Target = Cid;
-
-    fn deref(&self) -> &Self::Target {
-        &self.cid
-    }
-}
-
 pub struct Slice<T> {
     data: Box<[u8]>,
     marker: PhantomData<T>,
 }
 
 impl<T: Archive> Slice<T> {
-    fn decode(cid: Cid, data: &[u8]) -> Result<Self> {
+    pub fn decode(cid: &Cid, data: &[u8]) -> Result<Self> {
         let mut buf = Vec::with_capacity(cid.len().try_into()?);
         let mut decoder = SliceDecoder::new(data, &cid.hash(), cid.start(), cid.len());
         decoder.read_to_end(&mut buf)?;
@@ -183,13 +154,6 @@ impl<T: Archive> Block<T> {
         extractor.read_to_end(&mut buf)?;
         Ok(buf.into_boxed_slice())
     }
-
-    pub fn query(&self) -> Query<T> {
-        Query {
-            cid: self.cid,
-            marker: self.marker,
-        }
-    }
 }
 
 impl<T: Archive> Deref for Block<T> {
@@ -198,6 +162,10 @@ impl<T: Archive> Deref for Block<T> {
     fn deref(&self) -> &Self::Target {
         unsafe { archived_value::<T>(self.data.as_ref(), 0) }
     }
+}
+
+pub trait Selectable {
+    fn select(cid: &Cid, field: &str) -> Result<Cid>;
 }
 
 #[cfg(test)]
@@ -218,9 +186,15 @@ mod tests {
         text: String,
     }
 
-    impl AStruct {
-        fn select_nested(query: &Query<Self>) -> Query<BStruct> {
-            query.select(span_of!(Archived<Self>, nested))
+    impl Selectable for AStruct {
+        fn select(cid: &Cid, field: &str) -> Result<Cid> {
+            Ok(match field {
+                "boolean" => cid.slice(span_of!(Archived<Self>, boolean)),
+                "nested" => cid.slice(span_of!(Archived<Self>, nested)),
+                "link" => cid.slice(span_of!(Archived<Self>, link)),
+                "text" => cid.slice(span_of!(Archived<Self>, text)),
+                _ => anyhow::bail!("invalid key"),
+            })
         }
     }
 
@@ -230,9 +204,13 @@ mod tests {
         number: u32,
     }
 
-    impl BStruct {
-        fn select_number(query: &Query<Self>) -> Query<u32> {
-            query.select(span_of!(Archived<Self>, number))
+    impl Selectable for BStruct {
+        fn select(cid: &Cid, field: &str) -> Result<Cid> {
+            Ok(match field {
+                "prefix" => cid.slice(span_of!(Archived<Self>, prefix)),
+                "number" => cid.slice(span_of!(Archived<Self>, number)),
+                _ => anyhow::bail!("invalid key"),
+            })
         }
     }
 
@@ -246,11 +224,14 @@ mod tests {
         assert_eq!(block.nested.number, 42);
 
         // construct a query
-        let query = BStruct::select_number(&AStruct::select_nested(&Query::new(*block.cid())));
+        let query = block
+            .cid()
+            .select::<AStruct>("nested")?
+            .select::<BStruct>("number")?;
         // extract an authenticated byte slice
         let response = block.extract(query.start(), query.len())?;
         // check the byte slice
-        let number = query.decode(&response)?;
+        let number = Slice::<u32>::decode(&query, &response)?;
         assert_eq!(*number, 42);
         Ok(())
     }
@@ -264,9 +245,11 @@ mod tests {
 
         data.nested.number = 43;
         let block = Block::encode(&data, 80)?;
-        let query = BStruct::select_number(&AStruct::select_nested(&Query::new(cid)));
+        let query = cid
+            .select::<AStruct>("nested")?
+            .select::<BStruct>("number")?;
         let response = block.extract(query.start(), query.len())?;
-        assert!(query.decode(&response).is_err());
+        assert!(Slice::<u32>::decode(&query, &response).is_err());
         Ok(())
     }
 }

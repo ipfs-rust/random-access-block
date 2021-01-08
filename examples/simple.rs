@@ -1,6 +1,6 @@
 use anyhow::Result;
 use memoffset::span_of;
-use random_access_block::{Block, Cid, Query};
+use random_access_block::{Block, Cid, Selectable, Slice};
 use rkyv::{Archive, Archived};
 
 #[derive(Archive, Default, PartialEq)]
@@ -11,9 +11,15 @@ struct AStruct {
     text: String,
 }
 
-impl AStruct {
-    fn select_nested(query: &Query<Self>) -> Query<BStruct> {
-        query.select(span_of!(Archived<Self>, nested))
+impl Selectable for AStruct {
+    fn select(cid: &Cid, field: &str) -> Result<Cid> {
+        Ok(match field {
+            "boolean" => cid.slice(span_of!(Archived<Self>, boolean)),
+            "nested" => cid.slice(span_of!(Archived<Self>, nested)),
+            "link" => cid.slice(span_of!(Archived<Self>, link)),
+            "text" => cid.slice(span_of!(Archived<Self>, text)),
+            _ => anyhow::bail!("invalid key"),
+        })
     }
 }
 
@@ -23,9 +29,13 @@ struct BStruct {
     number: u32,
 }
 
-impl BStruct {
-    fn select_number(query: &Query<Self>) -> Query<u32> {
-        query.select(span_of!(Archived<Self>, number))
+impl Selectable for BStruct {
+    fn select(cid: &Cid, field: &str) -> Result<Cid> {
+        Ok(match field {
+            "prefix" => cid.slice(span_of!(Archived<Self>, prefix)),
+            "number" => cid.slice(span_of!(Archived<Self>, number)),
+            _ => anyhow::bail!("invalid key"),
+        })
     }
 }
 
@@ -38,11 +48,14 @@ fn main() -> Result<()> {
     assert_eq!(block.nested.number, 42);
 
     // construct a query
-    let query = BStruct::select_number(&AStruct::select_nested(&Query::new(*block.cid())));
+    let cid = block
+        .cid()
+        .select::<AStruct>("nested")?
+        .select::<BStruct>("number")?;
     // extract an authenticated byte slice
-    let response = block.extract(query.start(), query.len())?;
+    let response = block.extract(cid.start(), cid.len())?;
     // check the byte slice
-    let number = query.decode(&response)?;
+    let number = Slice::<u32>::decode(&cid, &response)?;
     assert_eq!(*number, 42);
     Ok(())
 }
